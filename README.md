@@ -19,7 +19,6 @@ A high-performance client-server network application written in C that uses epol
 - Each thread manages one listen socket and accepts one concurrent connection
 - Uses epoll for efficient event-driven I/O
 - Echoes back all received data
-- Tracks statistics per thread and per accepted connection
 
 ### Client
 - Single-threaded design managing multiple connections
