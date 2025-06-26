@@ -6,14 +6,17 @@ int connect_to_server(client_connection_meta_t *conn) {
     conn->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (conn->socket_fd == -1) {
         count_socket_error(errno);
-        perror("socket");
-        return -1;
+        printf("CLIENT FATAL: socket() failed for connection %d to port %d: %s\n", 
+               conn->thread_index, conn->port, strerror(errno));
+        printf("CLIENT: Exiting due to socket creation failure\n");
+        exit(1);
     }
     
     if (set_socket_nonblocking(conn->socket_fd) == -1) {
+        printf("CLIENT FATAL: Failed to set socket non-blocking for connection %d\n", conn->thread_index);
+        printf("CLIENT: Exiting due to socket configuration failure\n");
         close(conn->socket_fd);
-        conn->socket_fd = -1;
-        return -1;
+        exit(1);
     }
     
     memset(&server_addr, 0, sizeof(server_addr));
@@ -24,10 +27,11 @@ int connect_to_server(client_connection_meta_t *conn) {
     int result = connect(conn->socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (result == -1 && errno != EINPROGRESS) {
         count_socket_error(errno);
-        perror("connect");
+        printf("CLIENT FATAL: connect() failed for connection %d to %s:%d: %s\n", 
+               conn->thread_index, g_ctx.listen_ip, conn->port, strerror(errno));
+        printf("CLIENT: Exiting due to connection failure\n");
         close(conn->socket_fd);
-        conn->socket_fd = -1;
-        return -1;
+        exit(1);
     }
     
     conn->is_connected = (result == 0) ? 1 : 0;
@@ -62,13 +66,13 @@ int run_client(void) {
         g_ctx.client_connections[i].port = g_ctx.listen_port_start + i;
         g_ctx.client_connections[i].socket_fd = -1;
         
-        if (connect_to_server(&g_ctx.client_connections[i]) == 0) {
-            struct epoll_event event;
-            event.events = EPOLLIN | EPOLLOUT;
-            event.data.ptr = &g_ctx.client_connections[i];
-            epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, 
-                     g_ctx.client_connections[i].socket_fd, &event);
-        }
+        // connect_to_server will exit on failure, so this always succeeds
+        connect_to_server(&g_ctx.client_connections[i]);
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLOUT;
+        event.data.ptr = &g_ctx.client_connections[i];
+        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, 
+                 g_ctx.client_connections[i].socket_fd, &event);
     }
     
     struct epoll_event events[MAX_EVENTS];
@@ -101,17 +105,10 @@ int run_client(void) {
                         conn->is_connected = 1;
                     } else {
                         count_socket_error(error);
-                        // Reconnect
-                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_DEL, conn->socket_fd, NULL);
-                        close(conn->socket_fd);
-                        conn->reconnect_count++;
-                        if (connect_to_server(conn) == 0) {
-                            struct epoll_event event;
-                            event.events = EPOLLIN | EPOLLOUT;
-                            event.data.ptr = conn;
-                            epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
-                        }
-                        continue;
+                        printf("CLIENT FATAL: Connection failed to establish for connection %d to %s:%d: %s\n", 
+                               conn->thread_index, g_ctx.listen_ip, conn->port, strerror(error));
+                        printf("CLIENT: Exiting due to connection establishment failure\n");
+                        exit(1);
                     }
                 }
                 
@@ -147,12 +144,12 @@ int run_client(void) {
                         if (bytes_read == -1) {
                             count_socket_error(errno);
                         }
-                        if (connect_to_server(conn) == 0) {
-                            struct epoll_event event;
-                            event.events = EPOLLIN | EPOLLOUT;
-                            event.data.ptr = conn;
-                            epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
-                        }
+                        // connect_to_server will exit on failure, so this always succeeds
+                        connect_to_server(conn);
+                        struct epoll_event event;
+                        event.events = EPOLLIN | EPOLLOUT;
+                        event.data.ptr = conn;
+                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
                     }
                 } else {
                     // Track received bytes
@@ -165,12 +162,12 @@ int run_client(void) {
                         close(conn->socket_fd);
                         conn->reconnect_count++;
                         conn->is_connected = 0;
-                        if (connect_to_server(conn) == 0) {
-                            struct epoll_event event;
-                            event.events = EPOLLIN | EPOLLOUT;
-                            event.data.ptr = conn;
-                            epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
-                        }
+                        // connect_to_server will exit on failure, so this always succeeds
+                        connect_to_server(conn);
+                        struct epoll_event event;
+                        event.events = EPOLLIN | EPOLLOUT;
+                        event.data.ptr = conn;
+                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
                     }
                 }
             }
