@@ -131,20 +131,7 @@ int run_client(void) {
                     }
                 }
                 
-                // Check if we need to reconnect (both sent AND received all data)
-                if (conn->current_iteration_sent >= g_ctx.data_size_before_reconnect && 
-                    conn->current_iteration_received >= g_ctx.data_size_before_reconnect) {
-                    epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_DEL, conn->socket_fd, NULL);
-                    close(conn->socket_fd);
-                    conn->reconnect_count++;
-                    conn->is_connected = 0;
-                    if (connect_to_server(conn) == 0) {
-                        struct epoll_event event;
-                        event.events = EPOLLIN | EPOLLOUT;
-                        event.data.ptr = conn;
-                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
-                    }
-                }
+                // Remove reconnection logic from EPOLLOUT - moved to EPOLLIN
             }
             
             if (events[i].events & EPOLLIN) {
@@ -171,6 +158,20 @@ int run_client(void) {
                     // Track received bytes
                     conn->current_iteration_received += bytes_read;
                     conn->total_bytes_received += bytes_read;
+                    
+                    // Check if we need to reconnect - close when received amount equals target
+                    if (conn->current_iteration_received >= g_ctx.data_size_before_reconnect) {
+                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_DEL, conn->socket_fd, NULL);
+                        close(conn->socket_fd);
+                        conn->reconnect_count++;
+                        conn->is_connected = 0;
+                        if (connect_to_server(conn) == 0) {
+                            struct epoll_event event;
+                            event.events = EPOLLIN | EPOLLOUT;
+                            event.data.ptr = conn;
+                            epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
+                        }
+                    }
                 }
             }
         }
