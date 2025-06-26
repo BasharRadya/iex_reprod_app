@@ -24,6 +24,7 @@ typedef struct {
     int socket_fd;
     uint64_t bytes_received;
     uint64_t bytes_sent;
+    uint64_t bytes_pending_send;  // Bytes received but not yet fully sent back
     int is_active;
 } accepted_socket_meta_t;
 

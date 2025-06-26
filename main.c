@@ -163,8 +163,8 @@ int main(int argc, char *argv[]) {
     printf("  Port Range: %d-%d\n", g_ctx.listen_port_start, g_ctx.listen_port_start + g_ctx.num_threads - 1);
     if (!g_ctx.is_server) {
         printf("  Data Size Before Reconnect: %lu bytes\n", g_ctx.data_size_before_reconnect);
+        printf("  Stats Refresh: %d seconds\n\n", g_ctx.refresh_stats_seconds);
     }
-    printf("  Stats Refresh: %d seconds\n\n", g_ctx.refresh_stats_seconds);
     
     int result;
     if (g_ctx.is_server) {

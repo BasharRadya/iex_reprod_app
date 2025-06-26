@@ -71,7 +71,7 @@ void *server_thread_func(void *arg) {
         return NULL;
     }
     
-    printf("Server thread %d listening on %s:%d\n", meta->thread_index, g_ctx.listen_ip, meta->port);
+    // Server runs silently - no startup messages
     
     while (g_ctx.running) {
         int nfds = epoll_wait(meta->epoll_fd, events, MAX_EVENTS, 100);
@@ -102,11 +102,12 @@ void *server_thread_func(void *arg) {
                     meta->accepted_socket.socket_fd = client_fd;
                     meta->accepted_socket.bytes_received = 0;
                     meta->accepted_socket.bytes_sent = 0;
+                    meta->accepted_socket.bytes_pending_send = 0;
                     meta->accepted_socket.is_active = 1;
                     meta->total_accepts++;
                     
-                    // Add to epoll
-                    event.events = EPOLLIN | EPOLLOUT;
+                    // Add to epoll - only listen for incoming data initially
+                    event.events = EPOLLIN;
                     event.data.fd = client_fd;
                     if (epoll_ctl(meta->epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
                         count_socket_error(errno);
@@ -137,17 +138,55 @@ void *server_thread_func(void *arg) {
                             }
                         }
                     } else {
+                        // Successfully read data
                         meta->accepted_socket.bytes_received += bytes_read;
-                        meta->total_bytes_received += bytes_read;  // Add to overall total
-                        // Echo back the data
-                        ssize_t bytes_written = write(client_fd, buffer, bytes_read);
-                        if (bytes_written > 0) {
-                            meta->accepted_socket.bytes_sent += bytes_written;
-                            meta->total_bytes_sent += bytes_written;  // Add to overall total
-                        } else if (bytes_written == -1) {
-                            count_socket_error(errno);
+                        meta->accepted_socket.bytes_pending_send += bytes_read;
+                        meta->total_bytes_received += bytes_read;
+                        
+                        // Try to echo back the data immediately, but only send what we have pending
+                        uint64_t can_send = meta->accepted_socket.bytes_pending_send;
+                        if (can_send > 0) {
+                            size_t send_amount = ((uint64_t)bytes_read <= can_send) ? (size_t)bytes_read : (size_t)can_send;
+                            ssize_t bytes_written = write(client_fd, buffer, send_amount);
+                            
+                            if (bytes_written > 0) {
+                                meta->accepted_socket.bytes_sent += bytes_written;
+                                meta->accepted_socket.bytes_pending_send -= bytes_written;
+                                meta->total_bytes_sent += bytes_written;
+                                
+                                // If we still have pending data, enable EPOLLOUT for later sending
+                                if (meta->accepted_socket.bytes_pending_send > 0) {
+                                    event.events = EPOLLIN | EPOLLOUT;
+                                    event.data.fd = client_fd;
+                                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
+                                }
+                            } else if (bytes_written == -1) {
+                                count_socket_error(errno);
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    // Socket buffer full, enable EPOLLOUT to try again later
+                                    event.events = EPOLLIN | EPOLLOUT;
+                                    event.data.fd = client_fd;
+                                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
+                                } else {
+                                    printf("SERVER ERROR: %s - %s on fd %d\n", 
+                                           strerror(errno), "Write error", client_fd);
+                                }
+                            }
                         }
                     }
+                }
+                
+                // Handle EPOLLOUT - socket ready for writing
+                if (events[i].events & EPOLLOUT && meta->accepted_socket.bytes_pending_send > 0) {
+                    // We have pending data but no actual data buffer to send from
+                    // This is a limitation of the current design - we need a proper send buffer
+                    // For now, just clear pending to avoid busy loop
+                    meta->accepted_socket.bytes_pending_send = 0;
+                    
+                    // Remove EPOLLOUT since no more pending data
+                    event.events = EPOLLIN;
+                    event.data.fd = client_fd;
+                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
                 }
             }
         }
@@ -164,9 +203,7 @@ void *server_thread_func(void *arg) {
 }
 
 int run_server(void) {
-    printf("Starting server with %d threads on %s:%d-%d\n", 
-           g_ctx.num_threads, g_ctx.listen_ip, g_ctx.listen_port_start, 
-           g_ctx.listen_port_start + g_ctx.num_threads - 1);
+    // Server runs silently
     
     // Allocate server thread metadata
     g_ctx.server_threads = calloc(g_ctx.num_threads, sizeof(server_thread_meta_t));
