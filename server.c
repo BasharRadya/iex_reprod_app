@@ -102,7 +102,6 @@ void *server_thread_func(void *arg) {
                     meta->accepted_socket.socket_fd = client_fd;
                     meta->accepted_socket.bytes_received = 0;
                     meta->accepted_socket.bytes_sent = 0;
-                    meta->accepted_socket.bytes_pending_send = 0;
                     meta->accepted_socket.is_active = 1;
                     meta->total_accepts++;
                     
@@ -128,66 +127,50 @@ void *server_thread_func(void *arg) {
                             close(client_fd);
                             meta->accepted_socket.is_active = 0;
                         } else if (bytes_read == -1) {
-                            // Read error (including EAGAIN)
-                            count_socket_error(errno);
+                            // Read error - check if it's fatal
                             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                                // Fatal error - close connection
+                                // Fatal error - log and close connection
+                                count_socket_error(errno);
                                 epoll_ctl(meta->epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
                                 close(client_fd);
                                 meta->accepted_socket.is_active = 0;
                             }
+                            // EAGAIN/EWOULDBLOCK are normal in non-blocking I/O - don't log them
                         }
                     } else {
                         // Successfully read data
                         meta->accepted_socket.bytes_received += bytes_read;
-                        meta->accepted_socket.bytes_pending_send += bytes_read;
                         meta->total_bytes_received += bytes_read;
                         
-                        // Try to echo back the data immediately, but only send what we have pending
-                        uint64_t can_send = meta->accepted_socket.bytes_pending_send;
-                        if (can_send > 0) {
-                            size_t send_amount = ((uint64_t)bytes_read <= can_send) ? (size_t)bytes_read : (size_t)can_send;
-                            ssize_t bytes_written = write(client_fd, buffer, send_amount);
+                        // Echo back same amount of data - keep polling until all sent
+                        size_t total_written = 0;
+                        while (total_written < (size_t)bytes_read) {
+                            ssize_t bytes_written = write(client_fd, buffer + total_written, 
+                                                        bytes_read - total_written);
                             
                             if (bytes_written > 0) {
+                                total_written += bytes_written;
                                 meta->accepted_socket.bytes_sent += bytes_written;
-                                meta->accepted_socket.bytes_pending_send -= bytes_written;
                                 meta->total_bytes_sent += bytes_written;
-                                
-                                // If we still have pending data, enable EPOLLOUT for later sending
-                                if (meta->accepted_socket.bytes_pending_send > 0) {
-                                    event.events = EPOLLIN | EPOLLOUT;
-                                    event.data.fd = client_fd;
-                                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
-                                }
                             } else if (bytes_written == -1) {
-                                count_socket_error(errno);
                                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    // Socket buffer full, enable EPOLLOUT to try again later
-                                    event.events = EPOLLIN | EPOLLOUT;
-                                    event.data.fd = client_fd;
-                                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
+                                    // Socket buffer full - keep polling, no sleep
+                                    continue;
                                 } else {
-                                    printf("SERVER ERROR: %s - %s on fd %d\n", 
-                                           strerror(errno), "Write error", client_fd);
+                                    // Fatal write error - log and break
+                                    count_socket_error(errno);
+                                    printf("SERVER ERROR: %s - Write error on fd %d\n", 
+                                           strerror(errno), client_fd);
+                                    break;
                                 }
+                            } else {
+                                // bytes_written == 0 - shouldn't happen with TCP, but break to avoid infinite loop
+                                break;
                             }
                         }
                     }
                 }
-                
-                // Handle EPOLLOUT - socket ready for writing
-                if (events[i].events & EPOLLOUT && meta->accepted_socket.bytes_pending_send > 0) {
-                    // We have pending data but no actual data buffer to send from
-                    // This is a limitation of the current design - we need a proper send buffer
-                    // For now, just clear pending to avoid busy loop
-                    meta->accepted_socket.bytes_pending_send = 0;
-                    
-                    // Remove EPOLLOUT since no more pending data
-                    event.events = EPOLLIN;
-                    event.data.fd = client_fd;
-                    epoll_ctl(meta->epoll_fd, EPOLL_CTL_MOD, client_fd, &event);
-                }
+
             }
         }
     }
