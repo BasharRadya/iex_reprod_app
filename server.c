@@ -128,7 +128,11 @@ void *server_thread_func(void *arg) {
                             meta->accepted_socket.is_active = 0;
                         } else if (bytes_read == -1) {
                             // Read error - check if it's fatal
-                            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                // EAGAIN/EWOULDBLOCK - print for debugging
+                                printf("SERVER DEBUG: Read EAGAIN on fd %d\n", client_fd);
+                                fflush(stdout);
+                            } else {
                                 // Fatal error - log and close connection
                                 count_socket_error(errno);
                                 epoll_ctl(meta->epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
@@ -154,7 +158,10 @@ void *server_thread_func(void *arg) {
                                 meta->total_bytes_sent += bytes_written;
                             } else if (bytes_written == -1) {
                                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    // Socket buffer full - keep polling, no sleep
+                                    // Socket buffer full - print for debugging and keep polling
+                                    printf("SERVER DEBUG: Write EAGAIN on fd %d (sent %zu/%zd bytes)\n", 
+                                           client_fd, total_written, bytes_read);
+                                    fflush(stdout);
                                     continue;
                                 } else {
                                     // Fatal write error - log and break
