@@ -18,6 +18,7 @@
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 4096
 #define MAX_THREADS 100
+#define MAX_CONNECTIONS_PER_THREAD 1000
 
 // Socket metadata for accepted connections
 typedef struct {
@@ -37,7 +38,8 @@ typedef struct {
     uint64_t total_accepts;
     uint64_t total_bytes_received;  // Overall total across all connections
     uint64_t total_bytes_sent;      // Overall total across all connections
-    accepted_socket_meta_t accepted_socket;
+    accepted_socket_meta_t accepted_sockets[MAX_CONNECTIONS_PER_THREAD];
+    int active_connections;
     pthread_t thread_id;
 } server_thread_meta_t;
 

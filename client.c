@@ -5,17 +5,13 @@ int connect_to_server(client_connection_meta_t *conn) {
     
     conn->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (conn->socket_fd == -1) {
-        count_socket_error(errno);
-        printf("CLIENT FATAL: socket() failed for connection %d to port %d: %s\n", 
-               conn->thread_index, conn->port, strerror(errno));
-        printf("CLIENT: Exiting due to socket creation failure\n");
+        printf("CLIENT: socket() failed for connection %d: %s\n", 
+               conn->thread_index, strerror(errno));
         exit(1);
     }
     
     if (set_socket_nonblocking(conn->socket_fd) == -1) {
-        printf("CLIENT FATAL: Failed to set socket non-blocking for connection %d\n", conn->thread_index);
-        printf("CLIENT: Exiting due to socket configuration failure\n");
-        close(conn->socket_fd);
+        printf("CLIENT: Failed to set socket non-blocking for connection %d\n", conn->thread_index);
         exit(1);
     }
     
@@ -26,17 +22,15 @@ int connect_to_server(client_connection_meta_t *conn) {
     
     int result = connect(conn->socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (result == -1 && errno != EINPROGRESS) {
-        count_socket_error(errno);
-        printf("CLIENT FATAL: connect() failed for connection %d to %s:%d: %s\n", 
+        printf("CLIENT: connect() failed for connection %d to %s:%d: %s\n", 
                conn->thread_index, g_ctx.listen_ip, conn->port, strerror(errno));
-        printf("CLIENT: Exiting due to connection failure\n");
-        close(conn->socket_fd);
         exit(1);
     }
     
     conn->is_connected = (result == 0) ? 1 : 0;
     conn->current_iteration_sent = 0;
     conn->current_iteration_received = 0;
+    
     return 0;
 }
 
@@ -49,15 +43,14 @@ int run_client(void) {
     g_ctx.client_connections = calloc(g_ctx.num_threads, sizeof(client_connection_meta_t));
     if (!g_ctx.client_connections) {
         perror("calloc");
-        return -1;
+        exit(1);
     }
     
     // Create epoll
     g_ctx.client_epoll_fd = epoll_create1(0);
     if (g_ctx.client_epoll_fd == -1) {
-        count_socket_error(errno);
         perror("epoll_create1");
-        return -1;
+        exit(1);
     }
     
     // Initialize connections
@@ -65,30 +58,39 @@ int run_client(void) {
         g_ctx.client_connections[i].thread_index = i;
         g_ctx.client_connections[i].port = g_ctx.listen_port_start + i;
         g_ctx.client_connections[i].socket_fd = -1;
+        g_ctx.client_connections[i].reconnect_count = 0;
+        g_ctx.client_connections[i].total_bytes_sent = 0;
+        g_ctx.client_connections[i].total_bytes_received = 0;
         
-        // connect_to_server will exit on failure, so this always succeeds
         connect_to_server(&g_ctx.client_connections[i]);
+        
         struct epoll_event event;
         event.events = EPOLLIN | EPOLLOUT;
         event.data.ptr = &g_ctx.client_connections[i];
-        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, 
-                 g_ctx.client_connections[i].socket_fd, &event);
+        if (epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, 
+                     g_ctx.client_connections[i].socket_fd, &event) == -1) {
+            perror("epoll_ctl add client connection");
+            exit(1);
+        }
     }
     
     struct epoll_event events[MAX_EVENTS];
     char send_buffer[BUFFER_SIZE];
     char recv_buffer[BUFFER_SIZE];
     time_t last_stats_time = time(NULL);
+    int stats_printed = 0;
     
-    // Fill send buffer with a simple pattern (much faster than random)
+    // Fill send buffer with pattern
     memset(send_buffer, 0xAA, BUFFER_SIZE);
+    
+    printf("Client started, target data size per connection: %lu bytes\n", g_ctx.data_size_before_reconnect);
     
     while (g_ctx.running) {
         int nfds = epoll_wait(g_ctx.client_epoll_fd, events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno != EINTR) {
-                count_socket_error(errno);
                 perror("epoll_wait");
+                exit(1);
             }
             continue;
         }
@@ -104,15 +106,13 @@ int run_client(void) {
                     if (getsockopt(conn->socket_fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
                         conn->is_connected = 1;
                     } else {
-                        count_socket_error(error);
-                        printf("CLIENT FATAL: Connection failed to establish for connection %d to %s:%d: %s\n", 
-                               conn->thread_index, g_ctx.listen_ip, conn->port, strerror(error));
-                        printf("CLIENT: Exiting due to connection establishment failure\n");
+                        printf("CLIENT: Connection failed for connection %d: %s\n", 
+                               conn->thread_index, strerror(error));
                         exit(1);
                     }
                 }
                 
-                // Send data (only if we haven't sent enough yet)
+                // Send data if we haven't sent enough yet
                 if (conn->current_iteration_sent < g_ctx.data_size_before_reconnect) {
                     uint64_t to_send = BUFFER_SIZE;
                     if (conn->current_iteration_sent + to_send > g_ctx.data_size_before_reconnect) {
@@ -123,51 +123,61 @@ int run_client(void) {
                     if (bytes_sent > 0) {
                         conn->current_iteration_sent += bytes_sent;
                         conn->total_bytes_sent += bytes_sent;
-                    } else if (bytes_sent == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        count_socket_error(errno);
+                    } else if (bytes_sent == -1) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            printf("CLIENT: Write error on connection %d: %s\n", 
+                                   conn->thread_index, strerror(errno));
+                            exit(1);
+                        }
+                    } else {
+                        printf("CLIENT: Write returned 0 on connection %d\n", conn->thread_index);
+                        exit(1);
                     }
                 }
-                
-                // Remove reconnection logic from EPOLLOUT - moved to EPOLLIN
             }
             
             if (events[i].events & EPOLLIN) {
-                // Read echoed data and track it
                 ssize_t bytes_read = read(conn->socket_fd, recv_buffer, sizeof(recv_buffer));
-                if (bytes_read <= 0) {
-                    if (bytes_read == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                        // Connection closed or error
-                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_DEL, conn->socket_fd, NULL);
-                        close(conn->socket_fd);
-                        conn->reconnect_count++;
-                        conn->is_connected = 0;
-                        if (bytes_read == -1) {
-                            count_socket_error(errno);
-                        }
-                        // connect_to_server will exit on failure, so this always succeeds
-                        connect_to_server(conn);
-                        struct epoll_event event;
-                        event.events = EPOLLIN | EPOLLOUT;
-                        event.data.ptr = conn;
-                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
+                
+                if (bytes_read == 0) {
+                    printf("CLIENT %d: SERVER CLOSED CONNECTION fd=%d unexpectedly (sent=%lu, recv=%lu)\n", 
+                           conn->thread_index, conn->socket_fd, 
+                           conn->current_iteration_sent, conn->current_iteration_received);
+                    exit(1);
+                    
+                } else if (bytes_read == -1) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        printf("CLIENT: Read error on connection %d: %s\n", 
+                               conn->thread_index, strerror(errno));
+                        exit(1);
                     }
+                    
                 } else {
-                    // Track received bytes
+                    // Successfully read echoed data
                     conn->current_iteration_received += bytes_read;
                     conn->total_bytes_received += bytes_read;
                     
-                    // Check if we need to reconnect - close when received amount equals target
+                    // Check if we've received everything we sent
                     if (conn->current_iteration_received >= g_ctx.data_size_before_reconnect) {
+                        // Close connection - server will see this and close its side
                         epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_DEL, conn->socket_fd, NULL);
                         close(conn->socket_fd);
                         conn->reconnect_count++;
                         conn->is_connected = 0;
-                        // connect_to_server will exit on failure, so this always succeeds
+                        
+                        // Reset counters for next iteration
+                        conn->current_iteration_sent = 0;
+                        conn->current_iteration_received = 0;
+                        
+                        // Reconnect
                         connect_to_server(conn);
                         struct epoll_event event;
                         event.events = EPOLLIN | EPOLLOUT;
                         event.data.ptr = conn;
-                        epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event);
+                        if (epoll_ctl(g_ctx.client_epoll_fd, EPOLL_CTL_ADD, conn->socket_fd, &event) == -1) {
+                            perror("epoll_ctl add reconnected client");
+                            exit(1);
+                        }
                     }
                 }
             }
@@ -176,7 +186,27 @@ int run_client(void) {
         // Print statistics
         time_t current_time = time(NULL);
         if (current_time - last_stats_time >= g_ctx.refresh_stats_seconds) {
-            print_statistics();
+            if (stats_printed) {
+                // Move cursor up to overwrite previous statistics
+                // 4 lines (header + table header + separator + blank line) + number of connection lines
+                int lines_to_move_up = 4 + g_ctx.num_threads;
+                printf("\033[%dA", lines_to_move_up);
+            }
+            
+            printf("=== Client Statistics ===\n");
+            printf("Connection | Port | Reconnects | Total Sent | Total Recv | Iter Sent | Iter Recv | Status\n");
+            printf("-----------|------|------------|------------|------------|-----------|-----------|----------\n");
+            
+            for (int i = 0; i < g_ctx.num_threads; i++) {
+                client_connection_meta_t *conn = &g_ctx.client_connections[i];
+                printf("%-10d | %-4d | %-10lu | %-10lu | %-10lu | %-9lu | %-9lu | %s\n", 
+                       conn->thread_index, conn->port, conn->reconnect_count, 
+                       conn->total_bytes_sent, conn->total_bytes_received,
+                       conn->current_iteration_sent, conn->current_iteration_received,
+                       conn->is_connected ? "Connected" : "Connecting");
+            }
+            printf("\n");
+            stats_printed = 1;
             last_stats_time = current_time;
         }
     }
